@@ -1,15 +1,21 @@
 ---
-title: "my title"
-author: "Dummy Surname (dummy@mail.com)"
+title: "Hands-on III Analysis"
+author: "Cristina Torredemer Ortega (cristina.torredemer01@estudiant.upf.edu)"
 date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
 output:
   html_document:
     toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
     fig_caption: true
+editor_options: 
+  markdown: 
+    wrap: sentence
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
 # Exercise 1
@@ -26,21 +32,384 @@ Report the following performance metrics from cross-validation:
 
 How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?
 
-```{r}
+## 1.1. Environment Setup
 
+To initiate the machine learning analysis, we first set up our environment using a suite of specialized R packages.
+We use `dplyr` for data manipulation and to filter out unnecessary columns, while the `caret` framework allows to streamline the model training process and implement a robust cross-validation strategy.
+For the classification itself, we employ the `randomForest` algorithm to distinguish patient severity based on proteomic profiles, and the `pROC` package is used to calculate and visualize the model's performance through ROC curves and AUC scores.
+
+```{r}
+library(caret)
+library(randomForest)
+library(pROC)
+library(dplyr)
+library(tidyverse)
+library(readxl)
 ```
+
+### 1.1.2. Importing the Data
+
+To begin the analysis, we load the **patient metadata** saved from previous work (`patient_metadata`) alongside the **supplementary protein matrix** from the study's Excel file (`supp_table`).
+
+```{r, results='hide'}
+# Loading the exported patient_metadata from the previous assignment
+patient_metadata <- readRDS("data/patient_metadata_exported.rds")
+
+# Loading the Supplementary Table 3 from the paper
+supp_table <- read_excel("data/raw_data/Protein_matrix.xlsx", sheet = "Prot_and_meta_matrix")
+```
+
+### 1.1.3. Data Preparation
+
+#### 1.1.3.1. Cleaning the Protein Matrix
+
+In this step, we clean and restructure the raw supplementary data to create a usable protein matrix.
+Promoting the first row to column headers, assigning clear names to the identifier columns, and filtering out metabolites to focus exclusively on protein features.
+Finally, we isolate the numeric data and set unique Protein IDs as the row names to ensure the dataset is properly formatted for the machine learning model (`protein_matrix`).
+
+```{r, results='hide'}
+# Promoting the first row to be the column names 
+colnames(supp_table) <- as.character(supp_table[1,])
+supp_table <- supp_table[-1,] 
+
+# Naming the first two columns properly
+colnames(supp_table)[1] <- "Protein_ID"
+colnames(supp_table)[2] <- "Gene_Symbol"
+
+# Creating a filtered dataframe with only proteins (metabolites have NA or empty Gene Symbols)
+supp_table_filtered <- supp_table %>%
+  filter(!is.na(Gene_Symbol) & Gene_Symbol != "")
+
+# Keeping only UniProt format IDs (starting with P, Q or O followed by numbers)
+supp_table_filtered <- supp_table_filtered %>%
+  filter(grepl("^[PQO][0-9A-Z]{5,}$", Protein_ID))
+
+# Creating the protein matrix (Removing Gene_Symbol column)
+protein_matrix <- as.data.frame(supp_table_filtered[, -2])
+
+# Setting the Protein IDs as row names properly
+rownames(protein_matrix) <- as.character(protein_matrix$Protein_ID)
+
+# Removing the Protein_ID column
+protein_matrix <- protein_matrix[, -1]
+
+# Ensuring all values are numeric
+protein_matrix <- protein_matrix %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.x))))
+```
+
+#### 1.1.3.2. Transposing the Data
+
+To prepare the dataset for machine learning, we transpose the matrix so that patients are represented as rows and proteins as columns.
+[This reorientation aligns the data with standard classification requirements.]{.underline}
+
+```{r, results='hide'}
+ml_data_ready <- as.data.frame(t(protein_matrix))
+```
+
+#### 1.1.3.3. Log2 Normalization
+
+[To stabilize the variance and reduce the impact of outliers across the vast range of protein concentrations]{.underline}, we apply a log2 transformation to the dataset.
+We include a **small offset of 1** to ensure mathematical stability by preventing undefined values for any zero-level measurements.
+
+```{r, results='hide'}
+ml_data_log2 <- log2(ml_data_ready + 1)
+```
+
+#### 1.1.3.4. Missing Data Management and Imputation
+
+To address the challenges of missing values in the proteomic dataset, we implement a **two-step quality control process**.
+We first prune the data by removing proteins with high rates of missingness and then apply Minimum Value imputation to the remaining features, ensuring a complete and balanced matrix for the Random Forest algorithm.
+
+##### 1.1.3.4.1. Assessment and Feature Filtering
+
+In this step, we evaluate the extent of missing values to ensure the dataset's integrity for machine learning.
+By calculating the missingness percentage for each feature, [we remove proteins that are missing in more than 20% of patients]{.underline}, effectively narrowing the dataset down to the most consistent and reliable proteomic signals (`to_impute_filtered`).
+
+```{r, results='hide'}
+# Calculating the percentage of missing values for each protein (column)
+missing_pct <- colMeans(is.na(ml_data_log2)) * 100
+
+# Identifying proteins missing in more than 20% of patients
+to_remove <- names(missing_pct[missing_pct > 20])
+
+# Filtering the dataset
+to_impute_filtered <- ml_data_log2[, !(colnames(ml_data_log2) %in% to_remove)]
+print(paste("Proteins removed:", length(to_remove)))
+print(paste("Proteins remaining:", ncol(to_impute_filtered)))
+```
+
+##### 1.1.3.4.2. Quality Check
+
+We verify that the data to impute is: 1.
+Transposed 2.
+Numeric 3.
+Log-transformed.
+
+```{r, results='hide'}
+check_rows <- nrow(to_impute_filtered) == 31
+check_numeric <- is.numeric(to_impute_filtered[1,1])
+check_log <- max(to_impute_filtered, na.rm = TRUE) < 50 
+
+print(paste("Is the data ready for MVI?", check_rows && check_numeric && check_log))
+```
+
+##### 1.1.3.4.3. Minimum Value Imputation
+
+To address the remaining gaps in the dataset, we apply minimum value imputation by replacing any missing values with the minimum concentration for each specific protein.
+
+[We chose this approach over other methods like Mean Imputation because, in the case of proteins, missing measurements are usually proteins below the detection limit of the method used to measure them.]{.underline}
+
+```{r}
+# Minimal Value Imputation
+ml_data_imputed <- to_impute_filtered
+
+for(i in 1:ncol(ml_data_imputed)) {
+  # Search the minimum value of each protein (ignoring NAs)
+  min_val <- min(ml_data_imputed[,i], na.rm = TRUE)
+  if(is.infinite(min_val)) min_val <- 0
+  
+  # Change NAs to the minimum
+  ml_data_imputed[is.na(ml_data_imputed[,i]), i] <- min_val
+}
+
+# Z-score scaling: puts all proteins in the same scale (mean 0, sd 1), makes feature comparison easier afterwards
+ml_data_scaled <- as.data.frame(scale(ml_data_imputed))
+
+# Recover Patient_ID as a column
+ml_data_scaled$Patient_ID <- rownames(ml_data_imputed)
+```
+
+#### 1.1.3.5. Merging with Metadata
+
+To finalize the dataset, we synchronize the patient identifiers across both the imputed protein matrix (`ml_data_scaled`) and the metadata (`patient_metadata`) by cleaning any whitespace and ensuring consistent character formatting.
+Then perform a left join to attach the severity group labels to each patient's proteomic profile, creating the unified data frame required for the Random Forest classification (`ml_dataset`).
+
+```{r, results='hide'}
+# Cleaning the IDs in the new imputed protein data
+ml_data_scaled$Patient_ID <- trimws(as.character(ml_data_scaled$Patient_ID))
+
+# Cleaning the IDs in metadata
+patient_metadata$Patient_ID <- trimws(as.character(patient_metadata$Patient_ID))
+
+# Performing the join using the imputed data
+ml_dataset <- left_join(ml_data_scaled, 
+                        patient_metadata %>% select(Patient_ID, Group), 
+                        by = "Patient_ID")
+```
+
+#### 1.1.3.6. Filtering and Cleaning
+
+To finalize the preparation, we filter the dataset to include only the "Severe" and "non-Severe" groups and remove the patient identifiers to focus the model purely on protein features.
+We then convert the group labels into a factor and drop any unused levels, ensuring the target variable is correctly formatted before saving the complete, labeled dataset as an RDS file for the modeling phase (`ml_dataset_clean`).
+
+```{r, results='hide'}
+ml_dataset_clean <- ml_dataset %>%
+  filter(Group %in% c("Severe", "non-Severe")) %>% 
+  select(-Patient_ID)
+
+ml_dataset_clean$Group <- droplevels(as.factor(ml_dataset_clean$Group))
+
+# Saving the fully processed and labeled dataset
+saveRDS(ml_dataset_clean, "final_training_data.rds")
+```
+
+## 1.2. Running the Random Forest Model
+
+To begin the predictive modeling phase, we configure the Random Forest algorithm to classify patient severity using the processed proteomic features.
+
+[We establish a reproducible training environment by setting a seed and defining a 10-fold cross-validation scheme, which allows to rigorously evaluate the model's accuracy and stability across different subsets of the data.]{.underline}
+
+### 1.2.1. Training the model
+
+To ensure a reproducible and rigorous evaluation, we establish a **10-fold cross-validation framework** that partitions the data into multiple subsets for iterative testing.
+We then train the Random Forest model using the full proteomic profile to predict patient severity, **optimizing for the Area Under the ROC Curve (AUC)** to maximize the balance between sensitivity and specificity.
+
+```{r, results='hide'}
+set.seed(123)
+
+# Defining the training control (10-fold Cross-Validation)
+train_control <- trainControl(
+  method = "cv", 
+  number = 10,                 
+  classProbs = TRUE,           # Required for ROC/AUC
+  summaryFunction = twoClassSummary, 
+  savePredictions = "final"    
+)
+
+## Training the Random Forest
+
+# Renaming the levels to be R-friendly (replacing '-' with '_')
+levels(ml_dataset_clean$Group) <- c("non_Severe", "Severe")
+
+# Group ~ . means "Predict Group using all other columns (proteins)"
+rf_model <- train(
+  Group ~ .,                   
+  data = ml_dataset_clean,
+  method = "rf",               
+  trControl = train_control,
+  metric = "ROC",              
+  importance = TRUE            
+)
+
+# Saving the actual trained model object
+saveRDS(rf_model, "rf_severity_model.rds")
+```
+
+### 1.2.2. Evaluating Performance
+
+To evaluate the model's diagnostic power, we generate a **confusion matrix** based on the cross-validation results to [compare the predicted classifications against the actual patient severity levels]{.underline}.
+This allows to calculate key performance metrics—such as accuracy, sensitivity, and specificity—providing a clear picture of [how reliably the proteomic signatures can distinguish between severe and non-severe cases.]{.underline}
+
+```{r, results='hide'}
+# Extract predictions from the cross-validation
+cv_predictions <- rf_model$pred
+conf_matrix <- confusionMatrix(cv_predictions$pred, cv_predictions$obs)
+
+print(conf_matrix)
+```
+
+### 1.2.3. Plotting ROC Curve & Calculating AUC
+
+To visualize the model's trade-off between sensitivity and specificity, we generate a **Receiver Operating Characteristic (ROC)** curve and calculate the **Area Under the Curve (AUC)**.
+
+This metric provides a single scalar value representing the overall performance of the classifier, where an AUC closer to 1.0 indicates a superior ability to distinguish between severe and non-severe cases across all possible probability thresholds.
+
+```{r, results='hide'}
+# Calculating the ROC curve
+roc_obj <- roc(response = cv_predictions$obs, 
+               predictor = cv_predictions$Severe, 
+               levels = c("non_Severe", "Severe"))
+
+# Saving the ROC object 
+saveRDS(roc_obj, "roc_curve_data.rds")
+
+# Plotting the curve
+plot(roc_obj, 
+     col = "magenta", 
+     lwd = 3, 
+     main = "ROC Curve: Random Forest Prediction of Severity")
+
+# Adding the AUC value to the plot
+auc_val <- round(auc(roc_obj), 3)
+legend("bottomright", legend = paste("AUC =", auc_val), bty = "n", cex = 1.2)
+```
+
+```{r, results='hide'}
+# This shows the probability the model gave to each patient
+probabilities <- predict(rf_model, ml_dataset_clean, type = "prob")
+print(probabilities)
+```
+
+### 1.2.4. Label Permutation Test
+
+[To validate the model against overfitting]{.underline}, we performed a label permutation test.
+
+```{r}
+# Creating a "scrambled" version of the data
+set.seed(456)
+ml_data_permuted <- ml_dataset_clean
+ml_data_permuted$Group <- sample(ml_data_permuted$Group) # Randomize labels
+
+# Re-training the exact same model on the "fake" data
+rf_model_permuted <- train(
+  Group ~ ., 
+  data = ml_data_permuted,
+  method = "rf", 
+  trControl = trainControl(method = "cv", number = 10, classProbs = TRUE, summaryFunction = twoClassSummary, savePredictions = "final"),
+  metric = "ROC"
+)
+
+# Checking the AUC of the permuted model
+cv_predictions_permuted <- rf_model_permuted$pred
+roc_obj_permuted <- roc(response = cv_predictions_permuted$obs, 
+               predictor = cv_predictions_permuted$Severe, 
+               levels = c("non_Severe", "Severe"))
+
+print(round(auc(roc_obj_permuted), 3))
+```
+
+While the **true model** achieved an **AUC of 0.953**, the **model trained on randomized labels** produced an average **AUC of 0.558**.
+This drastic drop confirms that [the predictive power of our original model is derived from a genuine biological signal rather than the high dimensionality of the dataset (p≫n)]{.underline}.
+
+## 1.3. Final Model Performance Report
+
+The Random Forest model achieved an **AUC of 0.953**, demonstrating a robust biological signal for COVID-19 severity within the patient proteomic profiles.
+During preprocessing, **Minimum Value Imputation (MVI)** was deliberately chosen over Mean Imputation.
+In LC-MS proteomics, missing values typically represent proteins whose abundance falls below the instrument's limit of detection rather than random technical dropouts.
+[While Mean Imputation can artificially inflate performance metrics by creating false algorithmic splits, MVI ensures the model learns from genuine physiological baseline signals, yielding a more conservative and biologically valid evaluation.]{.underline}
+
+Analysis of the confusion matrix reveals a **notable imbalance between Sensitivity (0.9444) and Specificity (0.7692)**.
+The model is highly effective at identifying "non-Severe" patients, correctly classifying nearly all of them.
+However, the lower Specificity indicates the model struggles to reliably isolate the "Severe" cases.
+[This discrepancy suggests that the proteomic presentation of "Severe" COVID-19 is highly heterogeneous among patients, making it harder for the algorithm to establish a single, unified "severe" signature.]{.underline}
+
+Ultimately, while the model's predictive validity is confirmed by the label permutation test (which drastically reduced the AUC to \~0.56), **the p≫n challenge (1,286 proteins vs. 31 patients) remains a critical limitation.** These proteomic biomarkers show immense diagnostic promise but require validation in a larger, independent clinical cohort to mitigate overfitting and ensure generalizability.
 
 # Exercise 2
 
 **Identify and interpret the most important features**
 
-Using the trained Random Forest model from Exercise 1, identify the 25 most important protein features contributing to the classification. Disccus their biological relevance.
+## 2.1. Identification top 25
+
+Using the trained Random Forest model from Exercise 1, identify the 25 most important protein features contributing to the classification.
+Disccus their biological relevance.
 
 Compare your selected features to the proteins reported by the authors in Supplementary Table 5.
 
 ```{r}
+# Extract feature importance from the Random Forest model
+# scale = TRUE normalizes the importance scores from 0 to 100
+rf_importance <- varImp(rf_model, scale = TRUE)
 
+# Plot the top 25 most important proteins
+plot(rf_importance, top = 25, main = "Top 25 Most Important Proteins for COVID-19 Severity")
+
+# Extract the actual names of the top 25 proteins as a list
+importance_df <- rf_importance$importance
+importance_df$Overall <- importance_df[, 1]
+importance_df$Protein <- rownames(importance_df)
+top_25_proteins <- importance_df %>%
+  arrange(desc(Overall)) %>%
+  slice(1:25) %>%
+  pull(Protein)
 ```
+
+Our Random Forest model identified a highly relevant biological signature consisting of proteomic features.
+[The top 25 features are dominated by classic markers of systemic inflammation and the acute-phase response, such as CRP (#4), SAA1 (#6), and SAA2 (#2), which are known to surge during the cytokine storm characteristic of severe COVID-19.]{.underline}
+
+Beyond general inflammation, the model prioritized markers of vascular and coagulation stress, including Coagulation Factor V (#3), reflecting the thrombotic complications of the disease.
+Interestingly, the most important feature was **Albumin (ALB, #1)**, a key indicator of liver function and systemic inflammatory status, whose reduction in severe cases reflects the acute-phase response and metabolic dysregulation.
+Also notably ranked were **Carboxypeptidase N (CPN1, #7)** and **Alpha-1-acid glycoprotein (ORM1, #17)**, proteins involved in regulating inflammation and immune modulation, respectively.
+
+This proteomic signature provides a robust and biologically coherent view of disease progression, capturing both the systemic inflammatory response and the coagulation dysregulation characteristic of severe COVID-19.
+
+## 2.2. Comparison Supp Table 5
+
+```{r}
+# Extract proteins from Supp Table 5
+supp_table_5 <- read_excel("data/raw_data/table_s5.xlsx", sheet = 2)
+colnames(supp_table_5) <- as.character(supp_table_5[1,])
+supp_table_5 <- supp_table_5[-1,] 
+colnames(supp_table_5)[1] <- "Protein_ID"
+colnames(supp_table_5)[2] <- "Gene_Symbol"
+
+# Extract only UniProt protein IDs (filtering out metabolites)
+author_proteins <- supp_table_5$Protein_ID
+author_proteins <- author_proteins[grepl("^[PQO][0-9A-Z]{5,}$", author_proteins)]
+
+# Compare with our top 25 features (proteins)
+common_proteins <- intersect(top_25_proteins, author_proteins)
+
+print(paste("Number of important proteins in common between our RF model and the paper:", length(common_proteins)))
+print("Proteins identified by both:")
+print(common_proteins)
+```
+
+A comparison between our top 25 features and the 29 biomarkers reported by the authors in Supplementary Table 5 reveals an overlap of **14 proteins**: **P02768 (ALB), P0DJI9 (SAA2), P12259 (F5), P02741 (CRP), P0DJI8 (SAA1), P15169 (CPN1), P02750 (LRG1), P05452 (CLEC3B), P05155 (SERPING1), P13671 (C6), Q9UK55 (SERPINA10), Q14520 (HABP2), Q06033 (ITIH3), and Q86UD1 (OAF).**
+
+The fact that classic inflammatory markers like **Albumin (ALB, #1)**, **CRP (#4)**, and **SAA1 (#6)** are shared with the authors' final selection provides powerful external validation for our model.
+[This concordance indicates that these proteins carry an exceptionally robust biological signal for COVID-19 severity that remains dominant regardless of variations in the computational pipeline.]{.underline} Furthermore, the overlap of 14 out of 25 proteins confirms that our model successfully recapitulates the systemic acute-phase response described in the original study.
 
 # Exercise 3
 
@@ -50,17 +419,100 @@ Using the final Random Forest model trained on the full training cohort, predict
 
 Your task is to:
 
--   Apply the trained model to the test cohort.  
--   Obtain predicted probabilities of Severe disease for each patient.  
--   Assign predicted class labels based on these probabilities.  
--   Compare predictions to the true clinical labels.  
-
+-   Apply the trained model to the test cohort.\
+-   Obtain predicted probabilities of Severe disease for each patient.\
+-   Assign predicted class labels based on these probabilities.\
+-   Compare predictions to the true clinical labels.
 
 How does the model perform on the independent test cohort?
 
 ```{r}
+# Load test data from Supplementary Table 4
+test_raw <- read_excel("data/raw_data/table_s4.xlsx", sheet = 2) 
 
+# Preprocessing of the test data
+colnames(test_raw) <- as.character(test_raw[1,])
+test_raw <- test_raw[-1,]
+colnames(test_raw)[1] <- "Protein_ID"
+colnames(test_raw)[2] <- "Gene_Symbol"
+
+# Create protein matrix
+test_data <- as.data.frame(test_raw[, -2])
+rownames(test_data) <- as.character(test_data$Protein_ID)
+test_data <- test_data[, -1]
+test_data <- test_data %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.x))))
+
+# Transpose and apply log2
+test_data_t <- t(test_data)
+test_data_log2 <- as.data.frame(log2(as.matrix(test_data_t) + 1))
+
+# Maintain only the proteins we used for training
+features_train <- colnames(ml_dataset_clean)[-ncol(ml_dataset_clean)]
+features_missing <- setdiff(features_train, colnames(test_data_log2))
+test_final <- test_data_log2[, intersect(colnames(test_data_log2), features_train)]
+if(length(features_missing) > 0) {
+  for (protein in features_missing) {
+    test_final[, protein] <- 0
+  }
+}
+
+# MVI
+for(i in 1:ncol(test_final)) {
+  test_final[is.na(test_final[,i]), i] <- min(test_final[,i], na.rm = TRUE)
+}
+
+# Prediction
+test_probs <- predict(rf_model, newdata = test_final, type = "prob")
+test_preds <- predict(rf_model, newdata = test_final)
+
+## --- Test Evaluation ---
+
+test_final$Patient_ID <- trimws(as.character(rownames(test_final)))
+patient_metadata$Patient_ID <- trimws(as.character(patient_metadata$Patient_ID))
+test_total <- left_join(test_final, 
+                        patient_metadata %>% select(Patient_ID, Group), 
+                        by = "Patient_ID")
+
+test_total$Group <- gsub("-", "_", test_total$Group)
+test_actual_labels <- factor(test_total$Group, levels = c("non_Severe", "Severe"))
+
+# Confusion Matrix
+conf_matrix_test <- confusionMatrix(data = test_preds, reference = test_actual_labels)
+print("--- TEST COHORT CONFUSION MATRIX ---")
+print(conf_matrix_test)
+
+# ROC Curve Analysis
+roc_test <- roc(response = test_actual_labels, 
+                predictor = test_probs$Severe, 
+                levels = c("non_Severe", "Severe"))
+
+# Save the test ROC object
+saveRDS(roc_test, "roc_curve_test_data.rds")
+
+# Plot the curve
+plot(roc_test, 
+     col = "magenta", 
+     lwd = 3, 
+     main = "External Test ROC Curve: RF Prediction of Severity")
+
+# # Adding the AUC value to the plot
+auc_test_val <- round(auc(roc_test), 3)
+legend("bottomright", legend = paste("AUC =", auc_test_val), bty = "n", cex = 1.2)
 ```
+
+The evaluation of the Random Forest model on the independent external test cohort (n=10) yielded mixed results that highlight common challenges in proteomic machine learning.
+**In terms of strict classification, the model performed poorly**, achieving an **overall accuracy of only 0.40 (40%)**.
+This low accuracy is **driven by a severe prediction bias**, as the model classified all ten patients into the 'Severe' category, completely failing to identify the 'non_Severe' cases.
+
+However, evaluating the model solely on accuracy is misleading in this context.
+The **Area Under the ROC Curve (AUC)** achieved a value of **0.792**, indicating that **the algorithm still retains meaningful discriminatory power better than random chance**.
+The model successfully assigned relatively higher probability scores to the true severe patients, but all scores simply fell above the default 50% decision threshold.
+This discrepancy between a failed accuracy and a functional AUC is a classic symptom of batch effects or baseline shifts between different proteomic datasets.
+
+**It is probable that the external test cohort had a systematically higher baseline of protein intensities compared to the training data.** The model, calibrated to lower baseline values, interpreted this global shift as a severe inflammatory signature across all patients.
+
+Ultimately, while the biological relevance of the selected protein signature is somewhat validated by the AUC, [the strict failure in classification accuracy demonstrates that the absolute probability threshold is miscalibrated for new data.]{.underline} **This exercise underlines the critical necessity of applying cross-cohort normalization techniques to mitigate batch effects before deploying these predictive models in a real-world clinical setting.**
 
 # session info {.unnumbered}
 
