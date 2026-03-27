@@ -40,7 +40,7 @@ Vascular Markers: Significant contribution from markers of coagulation stress li
 Validation: 14 of the top 25 features overlapped with the authors' original biomarkers in Supplementary Table 5, confirming a highly stable biological signature.
 ```
 
-3.  External Prediction (Independent Cohort)
+### 3.  External Prediction (Independent Cohort)
 
 The model was tested on an independent cohort (n=10) to assess generalizability:
 
